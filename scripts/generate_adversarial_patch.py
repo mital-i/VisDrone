@@ -14,17 +14,7 @@ os.environ["YOLO_OFFLINE"] = "1"
 
 yolo = YOLO("yolov8n.pt")
 
-
 class UltralyticsYoloEstimator(PyTorchYolo):
-    """
-    PyTorchYolo subclass that fixes loss_gradient() for ultralytics YOLOv8.
-
-    ART's default loss_gradient() fails on ultralytics models because it calls
-    .backward() on a non-differentiable value. This override directly computes
-    gradients by minimizing sigmoid class confidence (out["scores"]) — the same
-    signal that suppresses detections — using PyTorch autograd.
-    """
-
     def loss_gradient(self, x: np.ndarray, y, **kwargs) -> np.ndarray:
         device = next(self.model.parameters()).device
 
@@ -72,13 +62,13 @@ art_detector = UltralyticsYoloEstimator(
     is_ultralytics=True,
 )
 
-def load_visdrone_val_batch(val_images_dir: Path, n: int = 4, size: tuple[int, int] = (640, 640)) -> np.ndarray:
+def load_visdrone_val_batch(val_images_dir: Path, size: tuple[int, int] = (640, 640)) -> np.ndarray:
     image_paths = sorted(
         [p for p in val_images_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
-    )[:n]
-    if len(image_paths) < n:
+    )
+    if len(image_paths) == 0:
         raise FileNotFoundError(
-            f"Expected at least {n} images in {val_images_dir}, found {len(image_paths)}"
+            f"Expected at least 1 image in {val_images_dir}, found {len(image_paths)}"
         )
 
     batch = []
@@ -162,7 +152,7 @@ def apply_patch_to_image(image_np: np.ndarray, patch: np.ndarray, location: tupl
 def get_image_original_size(image_path: Path) -> tuple[int, int]:
     """Get original image dimensions before resizing."""
     with Image.open(image_path) as img:
-        return img.size[::-1]  # (width, height) -> (height, width)
+        return img.size[::-1]  # transpose
 
 
 if __name__ == "__main__":
@@ -171,15 +161,15 @@ if __name__ == "__main__":
     output_dir = Path("outputs")
     output_dir.mkdir(exist_ok=True)
 
-    # Load batch of 4 images
-    images_np = load_visdrone_val_batch(val_images_dir, n=4)
-    print("Loaded batch shape:", images_np.shape)
+    images_np = load_visdrone_val_batch(val_images_dir)
+    print(f"Loaded batch shape: {images_np.shape}")
 
     # Get image file names for annotation loading
     image_paths = sorted(
         [p for p in val_images_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}]
-    )[:4]
+    )
     image_names = [p.name for p in image_paths]
+    print(f"Processing {len(image_paths)} images")
 
     # Get original size from first image
     orig_size = get_image_original_size(image_paths[0])
@@ -194,9 +184,9 @@ if __name__ == "__main__":
     try:
         print("\nTesting basic prediction...")
         preds = art_detector.predict(images_np)
-        print(f"✓ Prediction works. Got {len(preds)} predictions")
+        print(f"Passed. Got {len(preds)} predictions")
     except Exception as e:
-        print(f"✗ Prediction failed: {e}")
+        print(f"Failed: {e}")
         sys.exit(1)
 
     # Generate adversarial patch with RobustDPatch
@@ -220,18 +210,24 @@ if __name__ == "__main__":
     Image.fromarray(patch_uint8).save(output_dir / "adversarial_patch.png")
     print(f"Saved patch to {output_dir / 'adversarial_patch.png'}")
 
-    # Apply patch to all images and save samples
+    # Apply patch to all images and save results
+    print("\nApplying patch to all images...")
     patched_images = np.array([
         apply_patch_to_image(images_np[i], patch, location=PATCH_LOCATION)
         for i in range(len(images_np))
     ])
-    for i in range(min(2, len(image_paths))):
+    
+    # Save all patched images
+    patched_output_dir = output_dir / "patched_images"
+    patched_output_dir.mkdir(exist_ok=True)
+    for i in range(len(image_paths)):
         patched_uint8 = (np.transpose(patched_images[i], (1, 2, 0)) * 255).astype(np.uint8)
-        Image.fromarray(patched_uint8).save(output_dir / f"patched_sample_{i}.png")
-    print(f"Saved patched samples to {output_dir}/patched_sample_*.png")
+        image_name = image_paths[i].stem
+        Image.fromarray(patched_uint8).save(patched_output_dir / f"{image_name}_patched.png")
+    print(f"Saved {len(image_paths)} patched images to {patched_output_dir}/")
 
     # Before/after detection comparison
-    print("\n=== Before/After Detection Comparison ===")
+    print("\n    Before/After Detection Comparison    ")
     clean_preds = art_detector.predict(images_np)
     clean_counts = [len(pred.get("boxes", np.array([]))) for pred in clean_preds]
     total_clean = sum(clean_counts)
@@ -245,3 +241,13 @@ if __name__ == "__main__":
     delta = total_clean - total_patched
     pct = 100.0 * delta / max(total_clean, 1)
     print(f"Delta: {delta} detections ({pct:.1f}%)")
+    
+    # Per-image comparison
+    print("\n=== Per-Image Comparison ===")
+    print(f"{'Image':<40} {'Clean':>8} {'Patched':>8} {'Change':>8}")
+    print("-" * 65)
+    for i, image_path in enumerate(image_paths):
+        clean_det = clean_counts[i]
+        patched_det = patched_counts[i]
+        change = clean_det - patched_det
+        print(f"{image_path.name:<40} {clean_det:>8} {patched_det:>8} {change:>8}")
