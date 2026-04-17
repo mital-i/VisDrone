@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
 import sys
-
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 from PIL import Image
@@ -154,6 +155,93 @@ def get_image_original_size(image_path: Path) -> tuple[int, int]:
     with Image.open(image_path) as img:
         return img.size[::-1]  # transpose
 
+def plot_attack_results(clean_counts, patched_counts, clean_preds, patched_preds, output_dir):
+    """Generates and saves attack metrics as separate image files."""
+    
+    # 1. Prepare Data
+    clean_total = sum(clean_counts)
+    patched_total = sum(patched_counts)
+    total_suppressed = clean_total - patched_total
+    num_images = len(clean_counts)
+    
+    # Heatmap Data
+    suppression_heatmap_data = (np.array(clean_counts) - np.array(patched_counts)) / np.clip(clean_counts, 1, None)
+    suppression_heatmap_data = suppression_heatmap_data.reshape(1, -1)
+
+    # Filtered indices for confidence averages
+    filtered_indices = [i for i, c in enumerate(clean_counts) if c > 0 and len(patched_preds[i]['scores']) > 0]
+    
+    # --- Image 1: Summary Statistics (Text Box) ---
+    plt.figure(figsize=(8, 4))
+    if filtered_indices:
+        avg_clean_conf = np.mean([np.mean(clean_preds[i]['scores']) for i in filtered_indices])
+        avg_patch_conf = np.mean([np.mean(patched_preds[i]['scores']) for i in filtered_indices])
+        conf_drop_str = f"{avg_clean_conf:.2f} -> {avg_patch_conf:.2f}"
+    else:
+        conf_drop_str = "N/A"
+
+    results_text = (
+        f"Attack Impact Summary\n"
+        f"---------------------\n"
+        f"Clean Detections: {clean_total}\n"
+        f"Patched Detections: {patched_total}\n"
+        f"Objects Suppressed: {total_suppressed} ({(total_suppressed/max(1,clean_total))*100:.1f}%)\n"
+        f"Mean Confidence Drop: {conf_drop_str}"
+    )
+    plt.text(0.5, 0.5, results_text, ha='center', va='center', fontsize=12, family='monospace',
+             bbox=dict(boxstyle='round,pad=1', facecolor='#f5f5f5', edgecolor='#d0d0d0'))
+    plt.axis('off')
+    plt.title("Attack Summary Statistics", weight='bold')
+    plt.savefig(output_dir / "metric_1_summary.png", bbox_inches='tight')
+    plt.close()
+
+    # --- Image 2: Total Detections Comparison (Bar Chart) ---
+    plt.figure(figsize=(8, 6))
+    categories = ['Clean', 'Patched']
+    values = [clean_total, patched_total]
+    bars = plt.bar(categories, values, color=['#3498db', '#e74c3c'], width=0.6)
+    plt.title("Total Detected Objects: Before vs After Patching", weight='bold')
+    plt.ylabel('Object Count')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + (max(values)*0.01), int(yval), 
+                 ha='center', va='bottom', weight='bold')
+    
+    plt.savefig(output_dir / "metric_2_totals_bar.png", bbox_inches='tight')
+    plt.close()
+
+    # --- Image 3: Confidence Distribution (Histogram) ---
+    plt.figure(figsize=(10, 6))
+    clean_all_scores = np.concatenate([p['scores'] for p in clean_preds if len(p['scores'])>0])
+    patched_all_scores = np.concatenate([p['scores'] for p in patched_preds if len(p['scores'])>0])
+    
+    plt.hist(clean_all_scores, bins=20, density=True, color='#3498db', alpha=0.6, label='Clean', edgecolor='#2980b9')
+    plt.hist(patched_all_scores, bins=20, density=True, color='#e74c3c', alpha=0.6, label='Patched', edgecolor='#c0392b')
+    plt.axvline(0.5, color='#7f8c8d', linestyle='--', label='Conf. Threshold (0.5)')
+    
+    plt.title("Detection Confidence Distribution Shift", weight='bold')
+    plt.xlabel('Confidence Score')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.savefig(output_dir / "metric_3_confidence_hist.png", bbox_inches='tight')
+    plt.close()
+
+    # --- Image 4: Per-Image Loss (Heatmap) ---
+    plt.figure(figsize=(14, 3))
+    heatmap = plt.imshow(suppression_heatmap_data, cmap='Reds', aspect='auto', vmin=0, vmax=1)
+    plt.title("Per-Image Suppression Heatmap (White/Red = High Impact)", weight='bold')
+    plt.yticks([]) # Hide Y axis
+    plt.xlabel("Image Index")
+    
+    cbar = plt.colorbar(heatmap, orientation='vertical', pad=0.02)
+    cbar.set_label('Loss Fraction')
+    
+    plt.savefig(output_dir / "metric_4_loss_heatmap.png", bbox_inches='tight')
+    plt.close()
+
+    print(f"\n[Analysis] Individual metric images saved to: {output_dir}")
 
 if __name__ == "__main__":
     val_images_dir = Path("data/VisDrone2019-DET-val/images")
@@ -180,7 +268,6 @@ if __name__ == "__main__":
     )
     print(f"Loaded annotations for {len(labels_list)} images")
 
-    # Test basic prediction
     try:
         print("\nTesting basic prediction...")
         preds = art_detector.predict(images_np)
@@ -189,10 +276,9 @@ if __name__ == "__main__":
         print(f"Failed: {e}")
         sys.exit(1)
 
-    # Generate adversarial patch with RobustDPatch
     print("\n=== Generating adversarial patch (RobustDPatch) ===")
-    PATCH_SHAPE = (3, 150, 150)   # channels-first
-    PATCH_LOCATION = (50, 250)    # (y_start, x_start) — object-dense region
+    PATCH_SHAPE = (3, 150, 150)
+    PATCH_LOCATION = (50, 250)
 
     attack = RobustDPatch(
         estimator=art_detector,
@@ -205,19 +291,16 @@ if __name__ == "__main__":
     patch = attack.generate(x=images_np)
     print(f"Generated patch. Shape: {patch.shape}, Min: {patch.min():.4f}, Max: {patch.max():.4f}")
 
-    # Save patch as PNG
     patch_uint8 = (np.transpose(patch, (1, 2, 0)) * 255).astype(np.uint8)
     Image.fromarray(patch_uint8).save(output_dir / "adversarial_patch.png")
     print(f"Saved patch to {output_dir / 'adversarial_patch.png'}")
 
-    # Apply patch to all images and save results
     print("\nApplying patch to all images...")
     patched_images = np.array([
         apply_patch_to_image(images_np[i], patch, location=PATCH_LOCATION)
         for i in range(len(images_np))
     ])
     
-    # Save all patched images
     patched_output_dir = output_dir / "patched_images"
     patched_output_dir.mkdir(exist_ok=True)
     for i in range(len(image_paths)):
@@ -226,7 +309,6 @@ if __name__ == "__main__":
         Image.fromarray(patched_uint8).save(patched_output_dir / f"{image_name}_patched.png")
     print(f"Saved {len(image_paths)} patched images to {patched_output_dir}/")
 
-    # Before/after detection comparison
     print("\n    Before/After Detection Comparison    ")
     clean_preds = art_detector.predict(images_np)
     clean_counts = [len(pred.get("boxes", np.array([]))) for pred in clean_preds]
@@ -242,7 +324,8 @@ if __name__ == "__main__":
     pct = 100.0 * delta / max(total_clean, 1)
     print(f"Delta: {delta} detections ({pct:.1f}%)")
     
-    # Per-image comparison
+    plot_attack_results(clean_counts, patched_counts, clean_preds, patched_preds, output_dir)
+    
     print("\n=== Per-Image Comparison ===")
     print(f"{'Image':<40} {'Clean':>8} {'Patched':>8} {'Change':>8}")
     print("-" * 65)
