@@ -246,7 +246,7 @@ def plot_attack_results(clean_counts, patched_counts, clean_preds, patched_preds
 if __name__ == "__main__":
     val_images_dir = Path("data/VisDrone2019-DET-val/images")
     val_annotations_dir = Path("data/VisDrone2019-DET-val/annotations")
-    output_dir = Path("outputs")
+    output_dir = Path("outputs_dpatch_robust")
     output_dir.mkdir(exist_ok=True)
 
     images_np = load_visdrone_val_batch(val_images_dir)
