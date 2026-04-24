@@ -88,7 +88,7 @@ def prepare_data(image_dir: Path):
 
 if __name__ == "__main__":
     input_dir = Path("data/VisDrone2019-DET-val/images")
-    output_dir = Path("outputs_snal")
+    output_dir = Path("outputs/outputs_snal")
     output_dir.mkdir(exist_ok=True)
 
     x_test, candidates, image_paths = prepare_data(input_dir)
